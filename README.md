@@ -493,32 +493,61 @@ trusting `nvidia-smi` (see §8).
 ## 8. The GPU
 
 The server has four A10s but XGBoost was silently training on the CPU. Three
-separate causes, all now diagnosed:
+separate causes, all now diagnosed.
 
-1. **Version mismatch (the real cause).** The installed wheel was xgboost
-   **3.4.1, built against CUDA 13.3**; the driver is 565.57.01, which supports
-   **CUDA 12.7**. XGBoost reacts to "no usable GPU" with a warning and a
-   fallback to the CPU, while `device="cuda"` stays in the parameters — so
-   `print_params()` reports a GPU that is not being used, and `nvidia-smi`
-   shows 0 % utilisation. Confirmed by reading the device back out of the
-   booster: `save_config()["learner"]["generic_param"]["device"] == "cpu"`
-   even after `device="cuda"`. `xgboost 3.2.0` and `3.1.3` (CUDA 12.9 / 12.8)
-   both work: the same 200k×20 fit drops from 41 s to 0.79 s and the booster
-   reports `cuda:0`.
-2. **Thread oversubscription.** `nthread = os.cpu_count()` (40) is far worse
-   than 1 thread per fit: a 50-tree fit on 50k×10 took 0.33 s at `nthread=1`
-   and 11 s at `nthread=40`. For many small fits, run more processes with one
-   thread each, which is what `run_main_pool.sh` does (14 workers).
-3. **GPU does not help at this size.** Once the wheel matches the driver, the
-   GPU is only worth it for the largest channels: on `1L_eJJ`
-   (414k×30) 500 trees took 7.5 s on 8 CPU threads and 9.2 s on the GPU. For the
-   4L/3L channels used here the fits are 0.1–1.5 s and the data transfer
-   dominates. **The pool was therefore run on the CPU on purpose**, and the GPU
-   is the right choice only for `1L_*` and `2OSL_*`.
+### 8.1 Version mismatch — the real cause
+
+The venv's wheel is xgboost **3.4.1, built against CUDA 13.3**; the driver is
+565.57.01, which supports **CUDA 12.7**. XGBoost reacts to "no usable GPU" with
+a warning and a fallback to the CPU, while `device="cuda"` stays in the
+parameters — so `print_params()` reports a GPU that is not being used and
+`nvidia-smi` shows 0 % utilisation. Reading the device back out of the booster
+is the only reliable check:
+
+```
+$ python show_gpu.py            # venv's xgboost 3.4.1, built against CUDA 13.3
+xgboost 3.4.1, built against CUDA [13, 3]
+  requested=cpu   actually_used=cpu      95.61s
+  requested=cuda  actually_used=cpu     102.51s      <-- silently on the CPU
+
+$ python show_gpu.py            # xgboost 3.2.0, built against CUDA 12.9
+xgboost 3.2.0, built against CUDA [12, 9]
+  requested=cpu   actually_used=cpu     120.50s
+  requested=cuda  actually_used=cuda:0    2.62s      <-- 46x faster
+```
+
+The fix is to install a wheel whose CUDA major version the driver supports:
+
+```bash
+pip install --target /path/to/xgb312 "xgboost==3.2.0"
+export PYTHONPATH=/path/to/xgb312:$ROOT/lib
+```
+
+`3.1.3` (CUDA 12.8) and `3.2.0` (12.9) both work; `3.3.0` (13.3) and `3.4.1`
+(13.3) do not. This is a property of the wheel, not of the code, so it must be
+fixed in the environment — see `show_gpu.py`.
+
+### 8.2 Thread oversubscription
+
+`nthread = os.cpu_count()` (40) is far worse than one thread per fit: a 50-tree
+fit on 50k×10 took **0.33 s at `nthread=1` and 11 s at `nthread=40`**. For many
+small fits, run more processes with one thread each — which is what
+`run_main_pool.sh` does (14 workers, `OMP_NUM_THREADS=1`).
+
+### 8.3 The GPU does not help at this size
+
+Once the wheel matches the driver, the GPU is only worth it for the largest
+channels. On `1L_eJJ` (414k×30) 500 trees took **7.5 s on 8 CPU threads and
+9.2 s on the GPU**. For the 4L/3L channels the fits are 0.1–1.5 s and the data
+transfer dominates. **The 6144-model pool was therefore run on the CPU on
+purpose**; the GPU is the right choice only for `1L_*` and `2OSL_*`.
+
+### 8.4 The guard
 
 `cuda_is_available()` in `bdt_methods.py` now trains a two-tree model once per
-process and reads the device back out of the booster, so this class of silent
-fallback cannot recur.
+process and reads the device back out of the booster, so a silent fallback
+cannot recur — the earlier implementation returned `True` whenever
+`nvidia-smi` exited 0, which is exactly the case that was broken.
 
 ## 9. References
 
