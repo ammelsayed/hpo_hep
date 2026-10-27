@@ -1,5 +1,6 @@
 import math
 import numpy as np
+from sklearn.metrics import roc_auc_score
 
 def asimov_significance(s, b, b_err=0.0):
     """Discovery significance with background uncertainty."""
@@ -243,6 +244,240 @@ def threshold_from_signal_efficiency(scores, weights, efficiency):
 
 def significance_with_uncertainty(S, B, sigma_B):
     return S / np.sqrt(B + sigma_B**2) if (B + sigma_B**2) > 0 else 0.0
+
+
+# ---------------------------------------------------------------- #
+# HPO objective metrics
+# ---------------------------------------------------------------- #
+
+def weighted_ks(x1, w1, x2, w2):
+    """Weighted two-sample KS distance (max |ECDF1 - ECDF2|)."""
+    x1, w1 = np.asarray(x1, float), np.asarray(w1, float)
+    x2, w2 = np.asarray(x2, float), np.asarray(w2, float)
+    k1, k2 = w1 > 0, w2 > 0
+    x1, w1, x2, w2 = x1[k1], w1[k1], x2[k2], w2[k2]
+    if x1.size == 0 or x2.size == 0:
+        return np.nan
+    xs = np.unique(np.concatenate([x1, x2]))
+
+    def ecdf(x, w):
+        o = np.argsort(x, kind="mergesort")
+        cw = np.cumsum(w[o]) / np.sum(w)
+        i = np.searchsorted(x[o], xs, side="right") - 1
+        return np.where(i >= 0, cw[np.clip(i, 0, None)], 0.0)
+
+    return float(np.max(np.abs(ecdf(x1, w1) - ecdf(x2, w2))))
+
+
+def asimov_z_curve(y, score, w, b_reg=0.01):
+    """Cumulative Asimov Z for the cut `score >= t`, at every event's score.
+
+    `b_reg` is the HBC-style regularisation of the background, as a fraction of
+    the total background weight. Without it a cut that keeps signal and no
+    background has b = 0, and `amsasimov` maps that to Z = 0 -- the deepest,
+    most sensitive part of the tail would score zero instead of the highest.
+    With it, Z stays finite and grows with the signal that passes the cut.
+    """
+    o = np.argsort(-np.asarray(score), kind="mergesort")
+    ys, ws = np.asarray(y)[o], np.asarray(w, float)[o]
+    s = np.cumsum(np.where(ys == 1, ws, 0.0))
+    b = np.cumsum(np.where(ys == 0, ws, 0.0))
+    br = b_reg * b[-1] if b[-1] > 0 else 0.0
+    z = np.nan_to_num(amsasimov(s, b + br), nan=0.0)
+    return z, s, b
+
+
+def z_at_signal_efficiency(y, score, w, eff, b_reg=0.01):
+    """Asimov Z at the cut that keeps a fraction `eff` of the weighted signal."""
+    z, s, _ = asimov_z_curve(y, score, w, b_reg)
+    if s[-1] <= 0:
+        return 0.0
+    k = int(np.searchsorted(s, eff * s[-1]))
+    return float(z[min(k, len(z) - 1)])
+
+
+def separation_metrics(y, score, w):
+    """Separation-power candidates. All computed on weighted events."""
+    y = np.asarray(y).astype(int)
+    score = np.asarray(score, float)
+    w = np.asarray(w, float)
+    sig, bkg = y == 1, y == 0
+    if sig.sum() < 2 or bkg.sum() < 2:
+        return {}
+    z, s, b = asimov_z_curve(y, score, w)
+    s_tot, b_tot = s[-1], b[-1]
+
+    m_s = np.average(score[sig], weights=w[sig])
+    m_b = np.average(score[bkg], weights=w[bkg])
+    out = {
+        "z_unbinned": float(z.max()),
+        "z_eff10": z_at_signal_efficiency(y, score, w, 0.10),
+        "z_eff30": z_at_signal_efficiency(y, score, w, 0.30),
+        "auc": float(roc_auc_score(y, score, sample_weight=w)),
+        "ks_sep": weighted_ks(score[sig], w[sig], score[bkg], w[bkg]),
+        "mean_s": float(m_s),
+        "mean_b": float(m_b),
+        # diverges as the two means are pushed to 1 and 0
+        "mean_sep": float(min(1.0 / max(m_b, 1e-3) + 1.0 / max(1.0 - m_s, 1e-3), 1e6)),
+        # symmetric form, finite for a reversed classifier (that case is
+        # rejected by the shape guards anyway)
+        "mean_sep_sym": float(min(1.0 / max(m_b, 1e-3) + 1.0 / max(1.0 - m_s, 1e-3)
+                                  if m_s > m_b else 0.0, 1e6)),
+        "s_tot": float(s_tot), "b_tot": float(b_tot),
+        "sb": float(s_tot / b_tot) if b_tot > 0 else np.inf,
+    }
+    # binned Asimov sum in quadrature, 30 bins, same background regularisation
+    h_s, edges = np.histogram(score[sig], bins=30, range=(0, 1), weights=w[sig])
+    h_b, _ = np.histogram(score[bkg], bins=30, range=(0, 1), weights=w[bkg])
+    out["z_binned"] = float(np.sqrt(np.nansum(amsasimov(h_s, h_b + 0.01 * b_tot) ** 2)))
+    return out
+
+
+def shape_guards(y, score, w, n_bins=30):
+    """Detect classifiers that are useless whatever their objective value.
+
+    `degenerate`  no usable shape: everything in one bin, or the score is
+                  constant, or (almost) no event is left in the tail.
+    `inverted`    background scores above signal scores -> the sign is wrong.
+    """
+    y = np.asarray(y).astype(int)
+    score = np.asarray(score, float)
+    w = np.asarray(w, float)
+    sig, bkg = y == 1, y == 0
+    if sig.sum() < 2 or bkg.sum() < 2:
+        return {"degenerate": True, "inverted": True, "n_nonempty_bins": 0}
+
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(score, edges) - 1, 0, n_bins - 1)
+    counts = np.bincount(idx, minlength=n_bins).astype(float)
+    n_occ = int((counts > 0).sum())
+    top_share = float(counts.max() / counts.sum()) if counts.sum() else 1.0
+    same_bin = bool(n_occ <= 1)
+    # a score that is constant to numerical precision is the same failure
+    flat = bool(np.ptp(score) < 1e-9)
+    degenerate = bool(n_occ <= 1 or flat or top_share > 0.995)
+
+    m_s = np.average(score[sig], weights=w[sig])
+    m_b = np.average(score[bkg], weights=w[bkg])
+    inverted = bool(m_s < m_b)
+    return {
+        "degenerate": degenerate,
+        "inverted": inverted,
+        "same_bin": same_bin,
+        "flat": flat,
+        "n_nonempty_bins": n_occ,
+        "top_bin_share": top_share,
+        "mean_s": float(m_s), "mean_b": float(m_b),
+    }
+
+
+def overtraining_metrics(y_tr, s_tr, w_tr, y_va, s_va, w_va, n_bins=30):
+    """Overtraining candidates: compare the train score shape with the held-out one.
+
+    Weighted: the quantity that matters downstream is the *yield* distribution,
+    so a bin with many low-weight events must not count as much as a bin with a
+    few high-weight ones. (The p-value of a KS test on 21 copies of the same
+    background event would be meaningless, which is why `collapse_background`
+    removes the copies before this is called.)
+    """
+    y_tr, s_tr = np.asarray(y_tr).astype(int), np.asarray(s_tr, float)
+    y_va, s_va = np.asarray(y_va).astype(int), np.asarray(s_va, float)
+    w_tr, w_va = np.asarray(w_tr, float), np.asarray(w_va, float)
+    out = {}
+    for name, lab in (("sig", 1), ("bkg", 0)):
+        a, wa = s_tr[y_tr == lab], w_tr[y_tr == lab]
+        b, wb = s_va[y_va == lab], w_va[y_va == lab]
+        if a.size < 2 or b.size < 2:
+            out[f"ks_{name}"] = np.nan
+            out[f"mean_gap_{name}"] = np.nan
+            out[f"chi2_{name}"] = np.nan
+            continue
+        out[f"ks_{name}"] = weighted_ks(a, wa, b, wb)
+        sd = np.std(a)
+        out[f"mean_gap_{name}"] = abs(a.mean() - b.mean()) / sd if sd > 0 else np.nan
+        # binned chi2 of the two normalised shapes, with their statistical errors
+        h1, _ = np.histogram(a, bins=n_bins, range=(0, 1), weights=wa)
+        h2, _ = np.histogram(b, bins=n_bins, range=(0, 1), weights=wb)
+        e1, _ = np.histogram(a, bins=n_bins, range=(0, 1), weights=wa ** 2)
+        e2, _ = np.histogram(b, bins=n_bins, range=(0, 1), weights=wb ** 2)
+        if h1.sum() <= 0 or h2.sum() <= 0:
+            out[f"chi2_{name}"] = np.nan
+            continue
+        p1, p2 = h1 / h1.sum(), h2 / h2.sum()
+        var = e1 / max(h1.sum(), 1e-12) ** 2 + e2 / max(h2.sum(), 1e-12) ** 2
+        ok = var > 0
+        out[f"chi2_{name}"] = float(np.sum((p1[ok] - p2[ok]) ** 2 / var[ok])
+                                    / max(ok.sum() - 1, 1))
+
+    def _agg(key):
+        v = [out[f"{key}_sig"], out[f"{key}_bkg"]]
+        return float(np.nanmax(v)) if np.isfinite(v).any() else np.nan
+
+    out["ks_gap"] = _agg("ks")
+    out["mean_gap"] = _agg("mean_gap")
+    out["chi2"] = _agg("chi2")
+    return out
+
+
+def smoothness(y, score, w, n_bins=30):
+    """How spiky the score distribution is.
+
+    A classifier whose output is a set of isolated spikes cannot be used to fit
+    a template: the shape has no meaning between the spikes. Measured as the
+    largest ratio between a bin and the mean of its two neighbours, on the
+    weighted background (the dominant sample), with empty neighbours floored so
+    that the ratio stays finite.
+    """
+    score = np.asarray(score, float)
+    w = np.asarray(w, float)
+    bkg = np.asarray(y).astype(int) == 0
+    h, _ = np.histogram(score[bkg], bins=n_bins, range=(0, 1), weights=w[bkg])
+    if h.sum() <= 0:
+        return {"spike": np.inf, "empty_bins": n_bins, "n_bins": n_bins}
+    p = h / h.sum()
+    nbr = np.zeros_like(p)
+    nbr[1:-1] = 0.5 * (p[:-2] + p[2:])
+    nbr[0], nbr[-1] = p[1], p[-2]
+    ok = nbr > 0
+    spike = float(np.max(p[ok] / nbr[ok])) if ok.any() else np.inf
+    return {"spike": spike, "empty_bins": int((h == 0).sum()), "n_bins": n_bins}
+
+
+def evaluate_scores(y_tr, s_tr, w_tr, y_va, s_va, w_va):
+    """All HPO metrics for one trained model, in a single dict.
+
+    Computed once per trial so that every objective variant can be compared
+    offline on the same pool of models.
+    """
+    m = separation_metrics(y_va, s_va, w_va)
+    m.update(shape_guards(y_va, s_va, w_va))
+    m.update({f"ot_{k}": v for k, v in overtraining_metrics(y_tr, s_tr, w_tr,
+                                                            y_va, s_va, w_va).items()})
+    m.update({f"sm_{k}": v for k, v in smoothness(y_va, s_va, w_va).items()})
+    # same operating point on the training sample: the d-AMS idea of the PSO
+    # paper, expressed as a relative loss so that the 80/20 split does not bias it
+    z_tr10 = z_at_signal_efficiency(y_tr, s_tr, w_tr, 0.10)
+    z_va10 = m.get("z_eff10", 0.0)
+    m["dz_eff10"] = float(max(0.0, (z_tr10 - z_va10) / max(z_va10, 1e-6)))
+    m["z_eff10_train"] = float(z_tr10)
+    return m
+
+
+def hpo_objective(m, sep="z_unbinned", over="ks_gap", A=1.0, B=1.0, guard=-1e6):
+    """`A * x - B * y`, with the degenerate-shape guards.
+
+    Returns `guard` (a large negative number, not merely a small one) when the
+    classifier has no usable shape, so that such points are never selected.
+    """
+    if not m:
+        return guard
+    if m.get("degenerate") or m.get("inverted"):
+        return guard
+    x = m.get(sep)
+    y = m.get(f"ot_{over}", m.get(over))
+    if x is None or y is None or not np.isfinite(x) or not np.isfinite(y):
+        return guard
+    return float(A * x - B * y)
 
 def significance_above_cut(y_true, bdt_scores, weights=None, cut=0.90, sigma_B=10.0):
     """

@@ -35,6 +35,7 @@ ROOT.gROOT.SetStyle("ATLAS")
 
 # Optional
 from metrics import expected_significance_binned
+from metrics import evaluate_scores, hpo_objective
 from plotting import plot_feature
 
 # ---------------------------------------------------------------- #
@@ -69,13 +70,43 @@ logger = setup_logging(level=logging.INFO)
 # ---------------------------------------------------------------- #
 
 # Check if cuda is supported
-def cuda_is_available():
-    """Run nvidia-smi and hide the output, return True if nvidia-smi exited with code 0 (success)"""
-    try:
-        result = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL )
-        return result.returncode == 0
-    except FileNotFoundError:
+_CUDA_OK = None
+
+def cuda_is_available(probe=True):
+    """True only if XGBoost can actually train on a GPU.
+
+    `nvidia-smi` exiting 0 is not enough: the wheel is linked against one CUDA
+    major version and the driver only supports another, and XGBoost then falls
+    back to the CPU with a warning while `device="cuda"` stays in the params.
+    The model is silently trained on the CPU (and the GPU stays idle), which is
+    exactly the failure this probe exists to catch. So, once per process, train
+    a tiny model and read back the device the booster really used.
+    """
+    global _CUDA_OK
+    if _CUDA_OK is not None:
+        return _CUDA_OK
+    if not probe:
         return False
+    try:
+        if subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            _CUDA_OK = False
+            return _CUDA_OK
+        X = np.random.rand(256, 4).astype(np.float32)
+        y = (X[:, 0] > 0.5).astype(np.float32)
+        m = xgb.XGBClassifier(n_estimators=2, max_depth=2, device="cuda",
+                              tree_method="hist", verbosity=0)
+        m.fit(X, y, verbose=False)
+        cfg = json.loads(m.get_booster().save_config())
+        _CUDA_OK = cfg["learner"]["generic_param"]["device"].startswith("cuda")
+        if not _CUDA_OK:
+            logger.warning("XGBoost fell back to the CPU: the wheel's CUDA "
+                           "version is not supported by the driver. Train on "
+                           "the CPU or install a matching xgboost wheel.")
+    except Exception as exc:                      # noqa: BLE001 - any failure means "no GPU"
+        logger.warning(f"GPU probe failed ({exc}); using the CPU.")
+        _CUDA_OK = False
+    return _CUDA_OK
 
 def get_weights_info(w):
     if len(w) == 0: return "empty"
@@ -522,7 +553,13 @@ class BoostedDecisionTrees:
         self.update_features_names()
         return self
 
-    def _hpo_evaluate(self, model, X_val, y_val, w_val, metric="auc"):
+    def _hpo_evaluate(self, model, X_val, y_val, w_val, metric="auc", X_train=None,
+                      y_train=None, w_train=None):
+        """Score one trained model. `metric` selects the separation part.
+
+        The train arrays are only needed by the overtraining part of an
+        `Ax - By` objective; without them the objective is pure separation.
+        """
         if metric == "auc":
             y_pred = model.predict_proba(X_val)[:, 1]
             return roc_auc_score(y_val, y_pred, sample_weight=w_val)
@@ -536,7 +573,104 @@ class BoostedDecisionTrees:
             return float(expected_significance_binned(model, X_val, y_val, w_val, nbins = n_bins))
 
         raise ValueError(f"Unknown metric: {metric}")
-   
+
+    def _hpo_score(self, model, X_val, y_val, w_val, X_train, y_train, w_train):
+        """`A*x - B*y` with the degenerate-shape guards (see metrics.py).
+
+        x is a separation measure, y an overtraining measure between the
+        training sample and the validation sample. A model with no usable shape
+        (constant score, everything in one bin, reversed ordering) returns the
+        guard value, so that no search can ever select it.
+        """
+        s_val = model.predict_proba(X_val)[:, 1]
+        s_train = model.predict_proba(X_train)[:, 1]
+        m = evaluate_scores(y_train, s_train, w_train, y_val, s_val, w_val)
+        return hpo_objective(m, sep=self.hpo_sep, over=self.hpo_over,
+                             A=self.hpo_A, B=self.hpo_B), m
+
+    def train_HPO_PSO(self, n_particles=10, n_iter=20, seed=42,
+                      space=None, sep="z_unbinned", over="ks_gap", A=1.0, B=1.0,
+                      objective_name=None):
+        """Hyper-parameter optimisation by particle swarm optimisation.
+
+        Implements the PSO of Tani et al., Eur. Phys. J. C 81 (2021) 170:
+        momentum plus cognitive and social attraction, inertial weight
+        decreasing linearly from 0.8 to 0.4, momenta initialised within a
+        quarter of the range, a particle clipped at a bound loses its momentum.
+        The objective is `A*x - B*y` from metrics.py, not the AMS of the paper.
+
+        `space` maps a parameter name to (low, high, is_log); the default is the
+        same space used in the study scripts (`study_data.SPACE`).
+        """
+        from search import Space, PSO
+        if space is None:
+            from study_data import SPACE as space
+        self.hpo_sep, self.hpo_over, self.hpo_A, self.hpo_B = sep, over, A, B
+
+        X_train, y_train, w_train = self.ds["train"]["X"], self.ds["train"]["y"], self.ds["train"]["w"]
+        X_val, y_val, w_val = self.ds["val"]["X"], self.ds["val"]["y"], self.ds["val"]["w"]
+
+        if self.apply_standardization:
+            X_train = self.scaler.fit_transform(X_train)
+            X_val = self.scaler.transform(X_val)
+        if self.apply_weights_balancing:
+            w_train = self.balance_weights(y_train, w_train)
+
+        # `space` is expressed in *normalised* hessian units, i.e. the ranges
+        # XGBoost documents. The fit here uses the raw balanced weights, whose
+        # mean is ~1e-4, so each point is converted to raw units by multiplying
+        # by that mean. The two are exactly equivalent: a leaf is
+        # -soft(G, alpha)/(H + lambda) and
+        # (w, alpha, lambda, gamma, mcw) -> (k*w, k*alpha, k*lambda, k*gamma,
+        # k*mcw) leaves it unchanged. Without this the default mcw already
+        # exceeds the whole root hessian at these weights and every trial is a
+        # stump.
+        w_scale = float(np.mean(w_train))
+
+        def to_raw(p):
+            q = dict(p)
+            for k in ("reg_alpha", "reg_lambda", "gamma", "min_child_weight"):
+                if k in q:
+                    q[k] = float(q[k]) * w_scale
+            q["max_depth"] = int(q["max_depth"])
+            return q
+
+        sp = Space(space)
+        pso = PSO(sp, seed=seed, n_particles=n_particles, n_iter=n_iter)
+        print(f"Starting PSO hyperparameter optimisation ({objective_name or 'Ax-By'}) ...")
+        print(f" > Objective : {A}*{sep} - {B}*{over}.")
+        print(f" > Swarm     : {n_particles} particles x {n_iter} iterations.")
+
+        history = []
+        for k in range(n_iter):
+            pts = pso.ask(n_particles)
+            scores, details = [], []
+            for u in pts:
+                params = sp.decode(u)
+                model = xgb.XGBClassifier(**{**self.params, **to_raw(params)})
+                model.fit(X_train, y_train, sample_weight=w_train,
+                          eval_set=[(X_val, y_val)],
+                          sample_weight_eval_set=[w_val], verbose=False)
+                score, m = self._hpo_score(model, X_val, y_val, w_val,
+                                           X_train, y_train, w_train)
+                scores.append(score)
+                details.append(dict(params=params, score=score,
+                                    best_iteration=int(getattr(model, "best_iteration", 0) or 0),
+                                    **{k2: v for k2, v in m.items()
+                                       if k2 in ("z_unbinned", "ot_ks_gap", "auc")}))
+            pso.tell(pts, np.array(scores))
+            history.append(details)
+            print(f"  iter {k+1:3d}/{n_iter}  best={pso.global_best_s:.4f}", flush=True)
+
+        best_params = sp.decode(pso.global_best_x)
+        best_params["max_depth"] = int(best_params["max_depth"])
+        self.hpo_history = history
+        self.hpo_best_score = float(pso.global_best_s)
+        self.update_params(**to_raw(best_params), early_stopping_rounds=None)
+        self.train()
+        return self
+
+
     def train_HPO_CV(self, n_trials=30, n_folds=3, metric="auc", direction="maximize"):
 
         print("Starting hyperparameter optimisation (HOP) ...")
