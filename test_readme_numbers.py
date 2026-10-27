@@ -109,4 +109,40 @@ for ch, w20, w100 in [("4L_eeee", 0.335, 0.702), ("3L_eeeJ", -0.075, 0.559)]:
     check(f"{ch} rho at 20%", spearmanr(d.z_va_20, d.z_te).statistic, w20, 0.10)
     check(f"{ch} rho at 100%", spearmanr(d.z_va_100, d.z_te).statistic, w100, 0.05)
 
+print("\n=== section 6: cross-evaluated distributions, all 26 channels ===")
+ce = pd.read_csv("results/cross_eval/summary.csv")
+check("cross_eval channels", len(ce.channel.unique()), 26, 0)
+check("cross_eval configs", len(ce.config.unique()), 3, 0)
+z = ce.pivot_table(index="channel", columns="config", values="z")
+a = ce.pivot_table(index="channel", columns="config", values="auc")
+check("mean Z, baseline", float(z.baseline.mean()), 3.00, 0.02)
+check("mean Z, units fixed", float(z.baseline_units.mean()), 4.17, 0.02)
+check("mean Z, HPO", float(z.hpo.mean()), 4.45, 0.02)
+# the nine channels where the shipped defaults never split
+never_split = ["3L_eeeJ", "3L_eemuJ", "3L_emumuJ", "3L_mumumuJ",
+               "4L_eeee", "4L_eeemu", "4L_eemumu", "4L_emumumu", "4L_mumumumu"]
+check("channels with baseline Z = 0", int((z.baseline == 0).sum()), 9, 0)
+for ch in never_split:
+    assert z.loc[ch, "baseline"] == 0.0, (ch, z.loc[ch, "baseline"])
+    assert abs(a.loc[ch, "baseline"] - 0.5) < 1e-9, (ch, a.loc[ch, "baseline"])
+check("HPO beats baseline on", int((z.hpo > z.baseline).sum()), 26, 0)
+check("HPO beats units-fixed on", int((z.hpo > z.baseline_units).sum()), 21, 0)
+# the quoted per-channel rows
+for ch, want in [("1L_eJ", 1.78), ("1L_eJJ", 3.25), ("1L_muJJ", 3.59),
+                 ("2OSL_eeJ", 1.98), ("2OSL_emuJ", 13.85), ("2OSL_mumuJ", 1.88),
+                 ("2SSL_eeJ", 6.69), ("2SSL_mumuJ", 8.54), ("3L_eee", 2.54),
+                 ("3L_eeeJ", 3.44), ("3L_eemuJ", 6.61), ("3L_emumuJ", 7.48),
+                 ("3L_mumumuJ", 4.43), ("4L_eeee", 0.97), ("4L_mumumumu", 1.17)]:
+    check(f"cross_eval HPO Z {ch}", float(z.loc[ch, "hpo"]), want, 0.02)
+# the quoted AUC rows
+for ch, col, want in [("3L_eeeJ", "baseline", 0.5000), ("4L_eeee", "baseline", 0.5000),
+                      ("1L_eJJ", "baseline", 0.9686), ("1L_eJJ", "hpo", 0.9848),
+                      ("2OSL_mumuJ", "baseline", 0.9047),
+                      ("2OSL_mumuJ", "hpo", 0.9439),
+                      ("2SSL_eeJ", "baseline_units", 0.9710)]:
+    check(f"cross_eval AUC {ch} {col}", float(a.loc[ch, col]), want, 0.01)
+# the 4L losses quoted in the text
+for ch in ["4L_eeee", "4L_eeemu", "4L_eemumu", "4L_emumumu", "4L_mumumumu"]:
+    assert z.loc[ch, "hpo"] < z.loc[ch, "baseline_units"], ch
+
 print("\n" + ("ALL README NUMBERS CHECK OUT" if ok else "SOME NUMBERS DISAGREE"))

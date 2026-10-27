@@ -2,7 +2,7 @@
 import numpy as np
 from metrics import (separation_metrics, shape_guards, overtraining_metrics,
                      hpo_objective, evaluate_scores, weighted_ks,
-                     z_at_signal_efficiency, asimov_z_curve)
+                     z_at_signal_efficiency, asimov_z_curve, zmax)
 
 rng = np.random.RandomState(0)
 
@@ -65,6 +65,27 @@ wt = np.ones(8)
 assert z_at_signal_efficiency(yt, st, wt, 0.25) > 1.0, z_at_signal_efficiency(yt, st, wt, 0.25)
 zt, _, _ = asimov_z_curve(yt, st, wt)
 assert zt[3] > 1.0, zt          # after the 4th (highest) signal, b = 0
+
+# 6c. a constant score separates nothing, so its max-cut Z must be zero.
+#     Ties have to be blocked: walking tied events one at a time would let the
+#     constant "cut" after all the signal and report a large Z for a model with
+#     AUC = 0.5. This is the bug that made the raw-weight baseline look good.
+y_const = np.concatenate([np.ones(500, int), np.zeros(2000, int)])
+s_const = np.full(2500, 0.5)
+w_const = np.ones(2500)
+assert abs(zmax(y_const, s_const, w_const)) < 1e-9, zmax(y_const, s_const, w_const)
+assert separation_metrics(y_const, s_const, w_const)["z_unbinned"] < 1e-9
+# 6d. an inverted classifier also has its best cut at "everything passes", so it
+#     must be rejected too rather than credited with the whole-sample Z
+s_inv2 = np.where(y_const == 1, 0.3, 0.7)
+assert zmax(y_const, s_inv2, w_const) < 1e-9, zmax(y_const, s_inv2, w_const)
+assert shape_guards(y_const, s_inv2, w_const)["inverted"]
+assert separation_metrics(y_const, s_inv2, w_const)["z_unbinned"] < 1e-9
+# 6e. the same binary score, correctly oriented, must be credited normally
+s_ok2 = np.where(y_const == 1, 0.7, 0.3)
+assert zmax(y_const, s_ok2, w_const) > 10, zmax(y_const, s_ok2, w_const)
+# 6f. with real separation the tie handling must not lose anything
+assert zmax(y, sc, w) == max(asimov_z_curve(y, sc, w)[0])
 
 # 7. objective ordering: a better classifier scores higher for every (sep, over)
 m_good = separation_metrics(*make())

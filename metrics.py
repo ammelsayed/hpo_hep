@@ -277,12 +277,32 @@ def asimov_z_curve(y, score, w, b_reg=0.01):
     background has b = 0, and `amsasimov` maps that to Z = 0 -- the deepest,
     most sensitive part of the tail would score zero instead of the highest.
     With it, Z stays finite and grows with the signal that passes the cut.
+
+    Events with the *same* score are processed as one block. A cut can only be
+    placed between distinct scores, so walking tied events one at a time would
+    let a constant classifier "cut" after all its signal and before its
+    background -- reporting a large significance for a model that separates
+    nothing. Blocking the ties makes a constant score return Z = 0, which is the
+    correct answer.
     """
-    o = np.argsort(-np.asarray(score), kind="mergesort")
-    ys, ws = np.asarray(y)[o], np.asarray(w, float)[o]
-    s = np.cumsum(np.where(ys == 1, ws, 0.0))
-    b = np.cumsum(np.where(ys == 0, ws, 0.0))
-    br = b_reg * b[-1] if b[-1] > 0 else 0.0
+    score = np.asarray(score, float)
+    y = np.asarray(y)
+    w = np.asarray(w, float)
+    o = np.argsort(-score, kind="mergesort")
+    s_sorted, y_sorted, w_sorted = score[o], y[o], w[o]
+    # the last event of each run of equal scores: the only places a cut exists
+    last = np.r_[np.flatnonzero(np.diff(s_sorted) != 0), len(s_sorted) - 1]
+    ys, ws = y_sorted[last], w_sorted[last]
+    # weight of the whole block ending at each cut point
+    cw = np.cumsum(w_sorted)
+    cws = np.cumsum(np.where(y_sorted == 1, w_sorted, 0.0))
+    s = cws[last]
+    b = cw[last] - s
+    # the regularisation is a fraction of the *total* background, not of the
+    # background that survives the cut: otherwise a cut that keeps no
+    # background at all gets br = 0 and reports an infinite Z
+    b_tot = float(cw[-1] - cws[-1])
+    br = b_reg * b_tot if b_tot > 0 else 0.0
     z = np.nan_to_num(amsasimov(s, b + br), nan=0.0)
     return z, s, b
 
@@ -294,6 +314,25 @@ def z_at_signal_efficiency(y, score, w, eff, b_reg=0.01):
         return 0.0
     k = int(np.searchsorted(s, eff * s[-1]))
     return float(z[min(k, len(z) - 1)])
+
+
+def zmax(y, score, w, b_reg=0.01):
+    """The max-cut Asimov significance: `z_unbinned`.
+
+    Returns 0 when the score has no usable shape. Two failures have to be
+    excluded, both of which report the significance of the *whole sample* rather
+    than of a separation:
+
+    * a constant score has a single cut point, where all the signal and all the
+      background pass (10.7 in the toy case);
+    * an inverted score (background above signal) has its best "cut" at the
+      lowest score, where again everything passes.
+    """
+    g = shape_guards(y, score, w)
+    if g["degenerate"] or g["inverted"]:
+        return 0.0
+    z, _, _ = asimov_z_curve(y, score, w, b_reg)
+    return float(z.max()) if len(z) else 0.0
 
 
 def separation_metrics(y, score, w):
@@ -309,8 +348,13 @@ def separation_metrics(y, score, w):
 
     m_s = np.average(score[sig], weights=w[sig])
     m_b = np.average(score[bkg], weights=w[bkg])
+    # a constant score has one cut point, where everything passes, and the
+    # Asimov formula then reports the significance of the whole sample; an
+    # inverted score has the same problem at the other end. Neither is a
+    # separation measure, so both are gated exactly as in zmax.
+    degenerate = bool(np.ptp(score) < 1e-9 or m_s <= m_b)
     out = {
-        "z_unbinned": float(z.max()),
+        "z_unbinned": 0.0 if degenerate else float(z.max()),
         "z_eff10": z_at_signal_efficiency(y, score, w, 0.10),
         "z_eff30": z_at_signal_efficiency(y, score, w, 0.30),
         "auc": float(roc_auc_score(y, score, sample_weight=w)),

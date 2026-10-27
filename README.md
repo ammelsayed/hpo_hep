@@ -21,6 +21,13 @@ What does work, and is what should be used:
 | `MET > 200` on the 1L channels | **+43 % held-out `Z`** on average over four channels | §4.8 |
 | spend the budget on validation size, not on the optimiser | rank correlation with the truth 0.34 → 0.70 | §4.3 |
 
+Applied to all 26 channels and scored on cross-evaluated histograms (§6), the
+recipe gives a mean `Z` of **4.45** against **3.00** for the shipped defaults and
+**4.17** for the defaults with only the units fixed. It wins on 26/26 channels
+against the shipped baseline and 21/26 against the units-fixed one; the five
+losses are all `4L`, where the weight-based leaf floor over-regularises a sample
+of a few hundred signal events.
+
 The whole study is 6144 trained models on 8 channels plus a replication test in
 which each selected point is refit on the *other* half-sample, so that every
 claim is checked on data the choice never saw.
@@ -445,7 +452,133 @@ least stable and where a binned template should be checked before use.
    89 % of the signal. The 4L and 3L channels are statistics-limited and gain
    nothing from cuts.
 
-## 6. What this study did *not* establish
+## 6. Cross-evaluated score distributions for every channel
+
+This section answers the practical question directly: for each region, what do
+the signal and background score distributions look like when no event is scored
+by a model that trained on it, and what does the HPO recipe change?
+
+### 6.1 How the distributions are built
+
+Each region has two statistically independent half-samples. The honest histogram
+is built by **crossing** them:
+
+```
+model A: trained on DF1  ->  scores every event of DF2
+model B: trained on DF2  ->  scores every event of DF1
+histogram = the union of both sets of scores
+```
+
+Every event appears exactly once, and none is scored by a model that saw it.
+`test_cross_eval.py` checks the bookkeeping (every event once, weights
+preserved, histograms sum to the totals) and confirms that the in-sample signal
+mean is higher than the crossed one, which is the bias that the crossing removes.
+
+Each training half is split 80/20 internally: 80 % grows the trees, 20 % stops
+them. The half being predicted is never used to fit or to stop.
+
+Three configurations are compared, so that the effect of the HPO recipe is not
+confused with the effect of the weight-units bug:
+
+| id | what it is |
+|---|---|
+| `baseline` | the repo defaults as `bdt_methods.py` shipped them, raw physical weights |
+| `baseline_units` | the same defaults with the weights normalised (isolates the units bug) |
+| `hpo` | the recipe of §5: median good point, weight-based leaf floor, early stopping |
+
+### 6.2 Results, all 26 channels
+
+Cross-evaluated Asimov `Z`:
+
+| channel | baseline | baseline, units fixed | **HPO** | HPO vs units |
+|---|---|---|---|---|
+| `1L_eJ` | 1.66 | 1.67 | **1.78** | +6.6 % |
+| `1L_eJJ` | 2.37 | 2.25 | **3.25** | +44.4 % |
+| `1L_muJ` | 1.77 | 1.80 | **1.88** | +4.4 % |
+| `1L_muJJ` | 2.68 | 2.49 | **3.59** | +44.2 % |
+| `2OSL_eeJ` | 1.97 | 1.31 | **1.98** | +51.1 % |
+| `2OSL_emuJ` | 13.68 | 13.14 | **13.85** | +5.4 % |
+| `2OSL_mumuJ` | 1.50 | 1.20 | **1.88** | +56.7 % |
+| `2SSL_ee` | 3.54 | 3.62 | **3.71** | +2.5 % |
+| `2SSL_eeJ` | 5.86 | 6.58 | **6.69** | +1.7 % |
+| `2SSL_emu` | 5.54 | 5.61 | **5.67** | +1.1 % |
+| `2SSL_emuJ` | 10.31 | 10.64 | **11.15** | +4.8 % |
+| `2SSL_mumu` | 4.22 | 4.30 | **4.37** | +1.6 % |
+| `2SSL_mumuJ` | 7.43 | 8.08 | **8.54** | +5.7 % |
+| `3L_eee` | 2.38 | 2.49 | **2.54** | +2.0 % |
+| `3L_eeeJ` | **0.00** | 3.36 | **3.44** | +2.4 % |
+| `3L_eemu` | 4.83 | 4.94 | **5.09** | +3.0 % |
+| `3L_eemuJ` | **0.00** | 6.28 | **6.61** | +5.3 % |
+| `3L_emumu` | 5.35 | 5.42 | **5.68** | +4.8 % |
+| `3L_emumuJ` | **0.00** | 7.06 | **7.48** | +5.9 % |
+| `3L_mumumu` | 3.02 | 3.10 | **3.20** | +3.2 % |
+| `3L_mumumuJ` | **0.00** | 3.91 | **4.43** | +13.3 % |
+| `4L_eeee` | **0.00** | 1.09 | 0.97 | −11.0 % |
+| `4L_eeemu` | **0.00** | 2.33 | 2.31 | −0.9 % |
+| `4L_eemumu` | **0.00** | 2.44 | 2.35 | −3.7 % |
+| `4L_emumumu` | **0.00** | 2.20 | 2.15 | −2.3 % |
+| `4L_mumumumu` | **0.00** | 1.18 | 1.17 | −0.8 % |
+| **mean** | **3.00** | **4.17** | **4.45** | **median +3.8 %** |
+
+Three things stand out.
+
+1. **The baseline is not merely worse, it is broken on 9 of 26 channels.** On
+   `3L_eeeJ`, `3L_eemuJ`, `3L_emumuJ`, `3L_mumumuJ` and all five `4L` channels
+   the raw-weight defaults produce `AUC = 0.5000` and `Z = 0.00`: the trees
+   never split, exactly the hessian-unit failure of §3.2. The other channels
+   escape only because their signal samples are large enough that the default
+   `min_child_weight = 1` is not yet prohibitive.
+2. **The units fix alone recovers most of the loss**, and the HPO recipe adds a
+   further median +3.8 % on top of it. Where the units bug does *not* bite
+   (`2SSL_*`, `3L_eee`, `3L_emumu`) the HPO gain is small, 1–6 %.
+3. **HPO wins on 26/26 channels against the shipped baseline and 21/26 against
+   the units-fixed one.** The five exceptions are all `4L`, where it *loses*
+   1–11 %. Those are the statistics-starved regions: the leaf floor suggested by
+   the weights (30–44 in normalised units) is too high for a sample with a few
+   hundred signal events, so it over-regularises. **For the `4L` channels the
+   leaf floor should be lowered** — this is the one place where the recipe needs
+   a per-channel adjustment, and it is a genuine open item.
+
+The same comparison for AUC, which shows the ordering but not the tail:
+
+| channel | baseline | units fixed | HPO |
+|---|---|---|---|
+| `3L_eeeJ` | 0.5000 | 0.9759 | **0.9770** |
+| `4L_eeee` | 0.5000 | 0.9810 | 0.9767 |
+| `1L_eJJ` | 0.9686 | 0.9643 | **0.9848** |
+| `2OSL_mumuJ` | 0.9047 | 0.8436 | **0.9439** |
+| `2OSL_eeJ` | 0.9496 | 0.8890 | **0.9588** |
+| `2SSL_eeJ` | 0.9539 | 0.9710 | **0.9747** |
+
+The two `2OSL` channels are worth noting: the units-fixed baseline has a *lower*
+AUC than the shipped baseline while having a lower `Z`, which is another sign
+that these two regions are the least stable (their train-vs-test gap is ~0.3,
+see §4.9).
+
+### 6.3 The distributions
+
+Each figure overlays the signal and background score distributions of the two
+configurations for one channel, normalised to unit area and on a log scale.
+
+`4L_eeee` is the clearest case: the baseline is a single spike at 0.5 (a
+constant classifier, `AUC = 0.500`, `Z = 0`), while the HPO recipe gives a
+smooth, monotone distribution with the signal accumulated at high score.
+
+![4L_eeee](results/cross_eval/figures/score__4L_eeee.png)
+
+`1L_eJJ` shows the other typical behaviour: both models work, but the HPO recipe
+pushes the signal harder against the high-score end and pulls the background
+down, which is where the `+44 %` in `Z` comes from even though the AUC moves by
+less than 0.02.
+
+![1L_eJJ](results/cross_eval/figures/score__1L_eJJ.png)
+
+The remaining 24 channels are in `results/cross_eval/figures/score__<channel>.png`,
+and the overview is:
+
+![overview](results/cross_eval/figures/overview_z.png)
+
+## 7. What this study did *not* establish
 
 * The pool covers 8 channels with 48 fits each. The replication test is the
   strongest evidence in the repo, but it uses ~120 refits per channel, not all
@@ -462,8 +595,12 @@ least stable and where a binned template should be checked before use.
   hyper-parameters on the channels outside the pool was not tested.
 * `2OSL_eeJ` and `2OSL_mumuJ` show a gap of ~0.3 and need a dedicated check
   before their score shapes are used to fit a template.
+* **The `4L` channels lose 1–11 % under the recipe** (§6.2). The weight-based
+  leaf floor is too high for a sample with a few hundred signal events. Lowering
+  it per channel was not tuned here, because tuning it on the same sample that
+  is used to report the result is exactly the circularity this study avoids.
 
-## 7. Reproducing
+## 8. Reproducing
 
 ```bash
 source ~/root/bin/thisroot.sh
@@ -473,6 +610,7 @@ python test_metrics.py        # metric definitions and guards
 python test_search.py         # PSO / GA / TPE / random on a known function
 python test_study_data.py     # weight collapsing, unit equivalence, split
 python test_pso_class.py      # train_HPO_PSO end to end, incl. the unit fix
+python test_cross_eval.py     # the crossing: every event scored exactly once
 
 bash run_main_pool.sh         # the 6144-model pool  (~80 min, 14 workers)
 python analyse.py             # objective and algorithm comparison
@@ -488,9 +626,9 @@ python apply_recipe.py --channels <the rest>   # the recipe of section 5
 
 `bdt_methods.py` gained `train_HPO_PSO`, the PSO of Ref. [1] driven by the same
 `A*x - B*y` objective, and `cuda_is_available()` now *probes* the GPU instead of
-trusting `nvidia-smi` (see §8).
+trusting `nvidia-smi` (see §9).
 
-## 8. The GPU
+## 9. The GPU
 
 The server has four A10s but XGBoost was silently training on the CPU. Three
 separate causes, all now diagnosed.
@@ -549,7 +687,7 @@ process and reads the device back out of the booster, so a silent fallback
 cannot recur — the earlier implementation returned `True` whenever
 `nvidia-smi` exited 0, which is exactly the case that was broken.
 
-## 9. References
+## 10. References
 
 [1] L. Tani, D. Rand, C. Veelken, M. Kadastik, *Evolutionary algorithms for
 hyperparameter optimization in machine learning for application in high energy
